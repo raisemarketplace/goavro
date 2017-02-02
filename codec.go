@@ -29,6 +29,8 @@ import (
 	"io"
 	"reflect"
 	"strings"
+	"bytes"
+	"bufio"
 )
 
 const (
@@ -97,10 +99,22 @@ type Encoder interface {
 	Encode(io.Writer, interface{}) error
 }
 
+// JSONDecoder specifies structures that may be decoded as Avro JSON
+type JSONDecoder interface {
+	JSONDecode(io.Reader) (interface{}, error)
+}
+
+// JSONEncoder specifies structures that may be encoded as Avro JSON
+type JSONEncoder interface {
+	JSONEncode(io.Writer, interface{}) error
+}
+
 // The Codec interface supports both Decode and Encode operations.
 type Codec interface {
 	Decoder
 	Encoder
+	JSONDecoder
+	JSONEncoder
 	Schema() string
 	NewWriter(...WriterSetter) (*Writer, error)
 }
@@ -111,11 +125,15 @@ type CodecSetter func(Codec) error
 
 type decoderFunction func(io.Reader) (interface{}, error)
 type encoderFunction func(io.Writer, interface{}) error
+type jsonDecoderFunction func(io.Reader) (interface{}, error)
+type jsonEncoderFunction func(io.Writer, interface{}) error
 
 type codec struct {
 	nm     *name
 	df     decoderFunction
 	ef     encoderFunction
+	jdf    jsonDecoderFunction
+	jef    jsonEncoderFunction
 	schema string
 }
 
@@ -131,20 +149,19 @@ func (c codec) String() string {
 func newSymbolTable() *symtab {
 	return &symtab{
 		name:         make(map[string]*codec),
-		nullCodec:    &codec{nm: &name{n: "null"}, df: nullDecoder, ef: nullEncoder},
-		booleanCodec: &codec{nm: &name{n: "bool"}, df: booleanDecoder, ef: booleanEncoder},
-		intCodec:     &codec{nm: &name{n: "int32"}, df: intDecoder, ef: intEncoder},
+		nullCodec:    &codec{nm: &name{n: "null"}, df: nullDecoder, ef: nullEncoder, jdf: nullJSONDecoder, jef: nullJSONEncoder},
+		booleanCodec: &codec{nm: &name{n: "bool"}, df: booleanDecoder, ef: booleanEncoder, jdf: booleanJSONDecoder, jef: booleanJSONEncoder},
+		intCodec:     &codec{nm: &name{n: "int32"}, df: intDecoder, ef: intEncoder, jdf: intJSONDecoder, jef: intJSONEncoder},
 		longCodec:    longCodec(),
-		floatCodec:   &codec{nm: &name{n: "float32"}, df: floatDecoder, ef: floatEncoder},
-		doubleCodec:  &codec{nm: &name{n: "float64"}, df: doubleDecoder, ef: doubleEncoder},
-		bytesCodec:   &codec{nm: &name{n: "[]uint8"}, df: bytesDecoder, ef: bytesEncoder},
-		stringCodec:  &codec{nm: &name{n: "string"}, df: stringDecoder, ef: stringEncoder},
+		floatCodec:   &codec{nm: &name{n: "float32"}, df: floatDecoder, ef: floatEncoder, jdf: floatJSONDecoder, jef: floatJSONEncoder},
+		doubleCodec:  &codec{nm: &name{n: "float64"}, df: doubleDecoder, ef: doubleEncoder, jdf: doubleJSONDecoder, jef: doubleJSONEncoder},
+		bytesCodec:   &codec{nm: &name{n: "[]uint8"}, df: bytesDecoder, ef: bytesEncoder, jdf: bytesJSONDecoder, jef: bytesJSONEncoder},
+		stringCodec:  &codec{nm: &name{n: "string"}, df: stringDecoder, ef: stringEncoder, jdf: stringJSONDecoder, jef: stringJSONEncoder},
 	}
-
 }
 
 func longCodec() *codec {
-	return &codec{nm: &name{n: "int64"}, df: longDecoder, ef: longEncoder}
+	return &codec{nm: &name{n: "int64"}, df: longDecoder, ef: longEncoder, jdf: longJSONDecoder, jef: longJSONEncoder}
 }
 
 type symtab struct {
@@ -243,6 +260,20 @@ func (c codec) Decode(r io.Reader) (interface{}, error) {
 // into the Codec's schema.
 func (c codec) Encode(w io.Writer, datum interface{}) error {
 	return c.ef(w, datum)
+}
+
+// JSONDecode will read from the specified io.Reader, and return the next
+// datum from the stream, or an error explaining why the stream cannot
+// be converted into the Codec's schema.
+func (c codec) JSONDecode(r io.Reader) (interface{}, error) {
+	return c.jdf(r)
+}
+
+// JSONEncode will write the specified datum to the specified io.Writer,
+// or return an error explaining why the datum cannot be converted
+// into the Codec's schema.
+func (c codec) JSONEncode(w io.Writer, datum interface{}) error {
+	return c.jef(w, datum)
 }
 
 func (c codec) Schema() string {
@@ -346,7 +377,32 @@ func (st symtab) buildString(enclosingNamespace, typeName string, schema interfa
 
 type unionEncoder struct {
 	ef    encoderFunction
+	jef   jsonEncoderFunction
+	tn    string
 	index int32
+}
+
+func getUnionTypeName(friendlyName string, enclosingNamespace string, schema interface{}) (*name, error) {
+	var typeName string
+	switch schema.(type) {
+	case string:
+		typeName = schema.(string)
+	case map[string]interface{}:
+		schemaMap := schema.(map[string]interface{})
+		t, ok := schemaMap["type"]
+		if !ok {
+			return nil, newCodecBuildError(friendlyName, "type field is missing in :%v", schema)
+		}
+		switch t.(string) {
+		case "record", "enum", "fixed":
+			return newName(nameSchema(schemaMap), nameEnclosingNamespace(enclosingNamespace))
+		default:
+			typeName = t.(string)
+		}
+	default:
+		return nil, newCodecBuildError(friendlyName, "unsupported type in union %v", schema)
+	}
+	return newName(nameName(typeName), nameEnclosingNamespace(enclosingNamespace))
 }
 
 func (st symtab) makeUnionCodec(enclosingNamespace string, schema interface{}) (*codec, error) {
@@ -368,6 +424,7 @@ func (st symtab) makeUnionCodec(enclosingNamespace string, schema interface{}) (
 	// setup
 	nameToUnionEncoder := make(map[string]unionEncoder)
 	indexToDecoder := make([]decoderFunction, len(schemaArray))
+	nameToJSONDecoder := make(map[string]jsonDecoderFunction)
 	allowedNames := make([]string, len(schemaArray))
 
 	for idx, unionMemberSchema := range schemaArray {
@@ -377,7 +434,12 @@ func (st symtab) makeUnionCodec(enclosingNamespace string, schema interface{}) (
 		}
 		allowedNames[idx] = c.nm.n
 		indexToDecoder[idx] = c.df
-		nameToUnionEncoder[c.nm.n] = unionEncoder{ef: c.ef, index: int32(idx)}
+		name, err := getUnionTypeName(friendlyName, enclosingNamespace, unionMemberSchema)
+		if err != nil {
+			return nil, newCodecBuildError(friendlyName, "Can't get union type name: %s", err)
+		}
+		nameToJSONDecoder[name.n] = c.jdf
+		nameToUnionEncoder[c.nm.n] = unionEncoder{ef: c.ef, jef: c.jef, tn: name.n, index: int32(idx)}
 	}
 
 	invalidType := "datum ought match schema: expected: "
@@ -433,6 +495,128 @@ func (st symtab) makeUnionCodec(enclosingNamespace string, schema interface{}) (
 			}
 			if err = ue.ef(w, datum); err != nil {
 				return newEncoderError(friendlyName, err)
+			}
+			return nil
+		},
+		jdf: func(r io.Reader) (interface{}, error) {
+			// Convert from Avro JSON to regular JSON
+			// 1. Parse using regular JSON decoder could be null or {"type": "value"}
+			// 2. Figure out the JSON Avro decoder based on the type: null or "type"
+			// 3. Marshal to bytes and then use the JSON Avro decoder: decode "value"
+
+			// 1. Parse using regular JSON decoder
+			var value interface{}
+			decoder := json.NewDecoder(r)
+			decoder.UseNumber()
+			if err := decoder.Decode(&value); err != nil {
+				return nil, newDecoderError(friendlyName, err)
+			}
+
+			// 2. Figure out the JSON Avro decoder based on the type
+			// Lookup the type name
+			var typeName string
+			switch value.(type) {
+			case nil:
+				// Only allowed value for a non map in a union type
+				typeName = "null"
+			case map[string]interface{}:
+				// Single key: value with key = type
+				mapValue := value.(map[string]interface{})
+
+				// extract the first and only key and value
+				for k, v := range mapValue {
+					typeName = k
+					value = v
+					break
+				}
+			default:
+				return nil, newDecoderError(friendlyName, "unsupported union value %v", value)
+			}
+
+			// Type name extracted, lookup the JSON decoder func
+			jsonDecoderFunc, ok := nameToJSONDecoder[typeName]
+			if !ok {
+				return nil, newDecoderError(friendlyName, "unknown union type %v", typeName)
+			}
+
+			// 3. Marshal to bytes and then use the JSON Avro decoder
+			b, err := json.Marshal(value)
+			if err != nil {
+				return nil, newDecoderError(friendlyName, "union json decode failed: %v", err)
+			}
+
+			// Convert from Avro JSON to required data type
+			return jsonDecoderFunc(bytes.NewReader(b))
+		},
+		jef: func(w io.Writer, datum interface{}) error {
+			var err error
+
+			// Convert to Avro JSON
+			// 1. Lookup the union type
+			// 2. JSON Encode the value
+			// 3. Null is handled as is
+			// 4. Embed the value in a JSON dict {type: value}
+
+			// 1. Lookup the union type
+			var typeName string
+			switch datum.(type) {
+			default:
+				typeName = reflect.TypeOf(datum).String()
+			case map[string]interface{}:
+				typeName = "map"
+			case []interface{}:
+				typeName = "array"
+			case nil:
+				typeName = "null"
+			case Enum:
+				typeName = datum.(Enum).Name
+			case Fixed:
+				typeName = datum.(Fixed).Name
+			case *Record:
+				typeName = datum.(*Record).Name
+			}
+
+			// 2. JSON Encode the value
+			ue, ok := nameToUnionEncoder[typeName]
+			if !ok {
+				return newEncoderError(friendlyName, "union json encode error: invalid type %v", typeName)
+			}
+
+			// 3. Null is handled as is
+			if typeName == "null" {
+				if err = ue.jef(w, datum); err != nil {
+					return newEncoderError(friendlyName, "union json encode error: %v", err)
+				}
+				return nil
+			}
+
+			// 4. Embed the value in a JSON dict {type: value}
+			// Convert into Avro JSON in a tmp writer
+			var buff bytes.Buffer
+			var value interface{}
+			buffWriter := bufio.NewWriter(&buff)
+			if err := ue.jef(buffWriter, datum); err != nil {
+				return newEncoderError(friendlyName, "union json encode error: %v", err)
+			}
+			if err := buffWriter.Flush(); err != nil {
+				return newEncoderError(friendlyName, "union json encode error: %v", err)
+			}
+			decoder := json.NewDecoder(bufio.NewReader(&buff))
+			decoder.UseNumber()
+			if err := decoder.Decode(&value); err != nil {
+				return newEncoderError(friendlyName, err)
+			}
+
+			tmpDatum := map[string]interface{}{
+				ue.tn: value,
+			}
+			b, err := json.Marshal(tmpDatum)
+			if err != nil {
+				return newEncoderError(friendlyName, "union json encode error: %v", err)
+			}
+			n, err := w.Write(b)
+			if n < len(b) {
+				return newEncoderError(friendlyName, "union json encode error: %v(%v)", n, len(b))
 			}
 			return nil
 		},
@@ -515,6 +699,22 @@ func (st symtab) makeEnumCodec(enclosingNamespace string, schema interface{}) (*
 			}
 			return newEncoderError(friendlyName, "symbol not defined: %s", someString)
 		},
+		jdf: func(r io.Reader) (interface{}, error) {
+			// Enum is handled as a string
+			someValue, err := newJSONDecoder("string")(r)
+			if err != nil {
+				return nil, newDecoderError(friendlyName, err)
+			}
+			return Enum{nm.n, someValue.(string)}, nil
+		},
+		jef: func(w io.Writer, datum interface{}) error {
+			// Enum is handled as a string
+			someEnum, ok := datum.(Enum)
+			if !ok {
+				return newEncoderError(friendlyName, "expected: Enum; received: %T", datum)
+			}
+			return newJSONEncoder("string")(w, someEnum.Value)
+		},
 	}
 	st.name[nm.n] = c
 	return c, nil
@@ -587,9 +787,66 @@ func (st symtab) makeFixedCodec(enclosingNamespace string, schema interface{}) (
 			}
 			return nil
 		},
+		jdf: func(r io.Reader) (interface{}, error) {
+			someValue, err := newJSONDecoder("string")(r)
+			if err != nil {
+				return nil, newDecoderError(friendlyName, err)
+			}
+			someFixed := someValue.([]byte)
+			if len(someFixed) < int(size) {
+				return nil, newDecoderError(friendlyName, "buffer underrun")
+			}
+			return Fixed{nm.n, someFixed}, nil
+		},
+		jef: func(w io.Writer, datum interface{}) error {
+			someFixed, ok := datum.(Fixed)
+			if !ok {
+				return newEncoderError(friendlyName, "expected: Fixed; received: %T", datum)
+			}
+			if len(someFixed.Value) != int(size) {
+				return newEncoderError(friendlyName, "expected: %d bytes; received: %d", size, len(someFixed.Value))
+			}
+			return newJSONEncoder("string")(w, string(someFixed.Value))
+		},
 	}
 	st.name[nm.n] = c
 	return c, nil
+}
+
+type KeyVal struct {
+	Key string
+	Val interface{}
+}
+
+// Define an ordered map
+type OrderedMap []KeyVal
+
+// Implement the json.Marshaler interface
+func (omap OrderedMap) MarshalJSON() ([]byte, error) {
+	var buf bytes.Buffer
+
+	buf.WriteString("{")
+	for i, kv := range omap {
+		if i != 0 {
+			buf.WriteString(",")
+		}
+		// marshal key
+		key, err := json.Marshal(kv.Key)
+		if err != nil {
+			return nil, err
+		}
+		buf.Write(key)
+		buf.WriteString(":")
+		// marshal value
+		val, err := json.Marshal(kv.Val)
+		if err != nil {
+			return nil, err
+		}
+		buf.Write(val)
+	}
+
+	buf.WriteString("}")
+	return buf.Bytes(), nil
 }
 
 func (st symtab) makeRecordCodec(enclosingNamespace string, schema interface{}) (*codec, error) {
@@ -610,12 +867,14 @@ func (st symtab) makeRecordCodec(enclosingNamespace string, schema interface{}) 
 	}
 
 	fieldCodecs := make([]*codec, len(recordTemplate.Fields))
+	fieldCodecMap := make(map[string]*codec)
 	for idx, field := range recordTemplate.Fields {
 		var err error
 		fieldCodecs[idx], err = st.buildCodec(recordTemplate.n.namespace(), field.schema)
 		if err != nil {
 			return nil, newCodecBuildError(friendlyName, "record field ought to be codec: %+v", st, err)
 		}
+		fieldCodecMap[field.Name] = fieldCodecs[idx]
 	}
 
 	friendlyName = fmt.Sprintf("record (%s)", recordTemplate.Name)
@@ -655,6 +914,90 @@ func (st symtab) makeRecordCodec(enclosingNamespace string, schema interface{}) 
 				if err != nil {
 					return newEncoderError(friendlyName, err)
 				}
+			}
+			return nil
+		},
+		jdf: func(r io.Reader) (interface{}, error) {
+			someRecord, _ := NewRecord(recordSchemaRaw(schema), RecordEnclosingNamespace(enclosingNamespace))
+
+			// Read into regular JSON map
+			var datum map[string]interface{}
+			decoder := json.NewDecoder(r)
+			decoder.UseNumber()
+			if err := decoder.Decode(&datum); err != nil {
+				return nil, newDecoderError(friendlyName, err)
+			}
+
+			// Convert each field from Avro to regular structure
+			for key, value := range datum {
+				b, err := json.Marshal(value)
+				if err != nil {
+					return nil, newDecoderError(friendlyName, err)
+				}
+				field, err := someRecord.getField(key)
+				if err != nil {
+					return nil, newDecoderError(friendlyName, err)
+				}
+				fieldDatum, err := fieldCodecMap[key].JSONDecode(bytes.NewBuffer(b))
+				if err != nil {
+					return nil, newDecoderError(friendlyName, err)
+				}
+				field.Datum = fieldDatum
+			}
+			return someRecord, nil
+		},
+		jef: func(w io.Writer, datum interface{}) error {
+			someRecord, ok := datum.(*Record)
+			if !ok {
+				return newEncoderError(friendlyName, "expected: Record; received: %T", datum)
+			}
+			if someRecord.Name != recordTemplate.Name {
+				return newEncoderError(friendlyName, "expected: %v; received: %v", recordTemplate.Name, someRecord.Name)
+			}
+
+			var orderedMap OrderedMap
+			//jsonMap := make(map[string]interface{})
+			for idx, field := range someRecord.Fields {
+				var value interface{}
+				// check whether field datum is valid
+				if reflect.ValueOf(field.Datum).IsValid() {
+					value = field.Datum
+				} else if field.hasDefault {
+					value = field.defval
+				} else {
+					return newEncoderError(friendlyName, "field has no data and no default set: %v", field.Name)
+				}
+				var buff bytes.Buffer
+				tmpWriter := bufio.NewWriter(&buff)
+				err = fieldCodecs[idx].JSONEncode(tmpWriter, value)
+				if err != nil {
+					return newEncoderError(friendlyName, err)
+				}
+				if err := tmpWriter.Flush(); err != nil {
+					return newEncoderError(friendlyName, "record json encode error: %v", err)
+				}
+				var jsonValue interface{}
+				decoder := json.NewDecoder(bufio.NewReader(&buff))
+				decoder.UseNumber()
+				err := decoder.Decode(&jsonValue)
+				if err != nil {
+					return newEncoderError(friendlyName, err)
+				}
+				n, err := newName(nameName(field.Name))
+				if err != nil {
+					return newEncoderError(friendlyName, err)
+				}
+				orderedMap = append(orderedMap, KeyVal{n.shortname(), jsonValue})
+				//jsonMap[n.shortname()] = jsonValue
+			}
+			//b, err := json.Marshal(jsonMap)
+			b, err := json.Marshal(orderedMap)
+			if err != nil {
+				return newEncoderError(friendlyName, "record json encode error: %v", err)
+			}
+			n, err := w.Write(b)
+			if n < len(b) {
+				return newEncoderError(friendlyName, "record json encode error: %v(%v)", n, len(b))
 			}
 			return nil
 		},
@@ -753,6 +1096,66 @@ func (st symtab) makeMapCodec(enclosingNamespace string, schema interface{}) (*c
 			}
 			return nil
 		},
+		jdf: func(r io.Reader) (interface{}, error) {
+			var err error
+			var datum interface{}
+			var b []byte
+			var rawDatum map[string]interface{}
+			data := make(map[string]interface{})
+
+			decoder := json.NewDecoder(r)
+			decoder.UseNumber()
+			if err = decoder.Decode(&rawDatum); err != nil {
+				return nil, newDecoderError(friendlyName, err)
+			}
+			for k, v := range rawDatum {
+				if b, err = json.Marshal(v); err != nil {
+					return nil, newDecoderError(friendlyName, err)
+				}
+				if datum, err = valuesCodec.JSONDecode(bytes.NewReader(b)); err != nil {
+					return nil, newDecoderError(friendlyName, err)
+				}
+				data[k] = datum
+			}
+			return data, nil
+		},
+		jef: func(w io.Writer, datum interface{}) error {
+			dict, ok := datum.(map[string]interface{})
+			if !ok {
+				return newEncoderError(friendlyName, "expected: map[string]interface{}; received: %T", datum)
+			}
+			jsonDict := make(map[string]interface{})
+			for k, v := range dict {
+				var buff bytes.Buffer
+				var jsonObj interface{}
+				writer := bufio.NewWriter(&buff)
+				if err := valuesCodec.JSONEncode(writer, v); err != nil {
+					return newEncoderError(friendlyName, err)
+				}
+				err := writer.Flush()
+				if err != nil {
+					return newEncoderError(friendlyName, err)
+				}
+				decoder := json.NewDecoder(bufio.NewReader(&buff))
+				decoder.UseNumber()
+				if err := decoder.Decode(&jsonObj); err != nil {
+					return newEncoderError(friendlyName, err)
+				}
+				jsonDict[k] = jsonObj
+			}
+			b, err := json.Marshal(jsonDict)
+			if err != nil {
+				return newEncoderError(friendlyName, err)
+			}
+			n, err := w.Write(b)
+			if err != nil {
+				return newEncoderError(friendlyName, err)
+			}
+			if n < len(b) {
+				return newEncoderError(friendlyName, "map encode error %v(%v)", n, len(b))
+			}
+			return nil
+		},
 	}, nil
 }
 
@@ -839,6 +1242,64 @@ func (st symtab) makeArrayCodec(enclosingNamespace string, schema interface{}) (
 				}
 			}
 			return longEncoder(w, int64(0))
+		},
+		jdf: func(r io.Reader) (interface{}, error) {
+			var err error
+			var rawJsonArray []interface{}
+			decoder := json.NewDecoder(r)
+			decoder.UseNumber()
+			if err = decoder.Decode(&rawJsonArray); err != nil {
+				return nil, newDecoderError(friendlyName, err)
+			}
+
+			var jsonArray []interface{}
+			for _, jsonValue := range rawJsonArray {
+				var datum interface{}
+				var b []byte
+				if b, err = json.Marshal(jsonValue); err != nil {
+					return nil, newDecoderError(friendlyName, err)
+				}
+				if datum, err = valuesCodec.JSONDecode(bytes.NewReader(b)); err != nil {
+					return nil, newDecoderError(friendlyName, err)
+				}
+				jsonArray = append(jsonArray, datum)
+			}
+			return jsonArray, nil
+		},
+		jef: func(w io.Writer, datum interface{}) error {
+			// Check if it is an array
+			someArray, ok := datum.([]interface{})
+			if !ok {
+				return newEncoderError(friendlyName, "expected: []interface{}; received: %T", datum)
+			}
+			// Convert each value and then back to Avro JSON before doing a final encode.
+			var avroArray []interface{}
+			for _, someValue := range someArray {
+				var buff bytes.Buffer
+				var jsonObj interface{}
+				writer := bufio.NewWriter(&buff)
+				if err := valuesCodec.JSONEncode(writer, someValue); err != nil {
+					return newEncoderError(friendlyName, err)
+				}
+				if err := writer.Flush(); err != nil {
+					return newEncoderError(friendlyName, "array json encode error: %v", err)
+				}
+				decoder := json.NewDecoder(bufio.NewReader(&buff))
+				decoder.UseNumber()
+				if err := decoder.Decode(&jsonObj); err != nil {
+					return newEncoderError(friendlyName, err)
+				}
+				avroArray = append(avroArray, jsonObj)
+			}
+			b, err := json.Marshal(avroArray)
+			if err != nil {
+				return newEncoderError(friendlyName, "array json encode error: %v", err)
+			}
+			n, err := w.Write(b)
+			if n < len(b) {
+				return newEncoderError(friendlyName, "array json encode error: %v(%v)", n, len(b))
+			}
+			return nil
 		},
 	}, nil
 }
