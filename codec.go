@@ -382,7 +382,7 @@ type unionEncoder struct {
 	index int32
 }
 
-func getUnionTypeName(friendlyName string, enclosingNamespace string, schema interface{}) (*name, error) {
+func getUnionTypeName(friendlyName string, enclosingNamespace string, schema interface{}) (string, error) {
 	var typeName string
 	switch schema.(type) {
 	case string:
@@ -391,18 +391,31 @@ func getUnionTypeName(friendlyName string, enclosingNamespace string, schema int
 		schemaMap := schema.(map[string]interface{})
 		t, ok := schemaMap["type"]
 		if !ok {
-			return nil, newCodecBuildError(friendlyName, "type field is missing in :%v", schema)
+			return "", newCodecBuildError(friendlyName, "type field is missing in :%v", schema)
 		}
 		switch t.(string) {
 		case "record", "enum", "fixed":
-			return newName(nameSchema(schemaMap), nameEnclosingNamespace(enclosingNamespace))
+			name, err := newName(nameSchema(schemaMap), nameEnclosingNamespace(enclosingNamespace))
+			if err != nil {
+				return "", err
+			}
+			return name.n, nil
 		default:
 			typeName = t.(string)
 		}
 	default:
-		return nil, newCodecBuildError(friendlyName, "unsupported type in union %v", schema)
+		return "", newCodecBuildError(friendlyName, "unsupported type in union %v", schema)
 	}
-	return newName(nameName(typeName), nameEnclosingNamespace(enclosingNamespace))
+	switch typeName {
+	default:
+		name, err := newName(nameName(typeName), nameEnclosingNamespace(enclosingNamespace))
+		if err != nil {
+			return "", err
+		}
+		return name.n, nil
+	case "null", "boolean", "int", "long", "float", "double", "bytes", "string":
+		return typeName, nil
+	}
 }
 
 func (st symtab) makeUnionCodec(enclosingNamespace string, schema interface{}) (*codec, error) {
@@ -434,12 +447,12 @@ func (st symtab) makeUnionCodec(enclosingNamespace string, schema interface{}) (
 		}
 		allowedNames[idx] = c.nm.n
 		indexToDecoder[idx] = c.df
-		name, err := getUnionTypeName(friendlyName, enclosingNamespace, unionMemberSchema)
+		unionType, err := getUnionTypeName(friendlyName, enclosingNamespace, unionMemberSchema)
 		if err != nil {
 			return nil, newCodecBuildError(friendlyName, "Can't get union type name: %s", err)
 		}
-		nameToJSONDecoder[name.n] = c.jdf
-		nameToUnionEncoder[c.nm.n] = unionEncoder{ef: c.ef, jef: c.jef, tn: name.n, index: int32(idx)}
+		nameToJSONDecoder[unionType] = c.jdf
+		nameToUnionEncoder[c.nm.n] = unionEncoder{ef: c.ef, jef: c.jef, tn: unionType, index: int32(idx)}
 	}
 
 	invalidType := "datum ought match schema: expected: "
@@ -536,6 +549,7 @@ func (st symtab) makeUnionCodec(enclosingNamespace string, schema interface{}) (
 			// Type name extracted, lookup the JSON decoder func
 			jsonDecoderFunc, ok := nameToJSONDecoder[typeName]
 			if !ok {
+				fmt.Printf("Union types are %v\n", nameToJSONDecoder)
 				return nil, newDecoderError(friendlyName, "unknown union type %v", typeName)
 			}
 
@@ -938,7 +952,7 @@ func (st symtab) makeRecordCodec(enclosingNamespace string, schema interface{}) 
 				if err != nil {
 					return nil, newDecoderError(friendlyName, err)
 				}
-				fieldDatum, err := fieldCodecMap[key].JSONDecode(bytes.NewBuffer(b))
+				fieldDatum, err := fieldCodecMap[field.Name].JSONDecode(bytes.NewBuffer(b))
 				if err != nil {
 					return nil, newDecoderError(friendlyName, err)
 				}
