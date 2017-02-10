@@ -19,19 +19,25 @@
 package goavro
 
 import (
-	"io"
 	"encoding/json"
+	"io"
 )
+
+func jsonDecode(r io.Reader, friendlyName string) (interface{}, error) {
+	// Use the decoder interface as it enables parsing numbers as string.
+	// This takes care of overflow/underflow for float & double.
+	decoder := json.NewDecoder(r)
+	decoder.UseNumber()
+	var datum interface{}
+	if err := decoder.Decode(&datum); err != nil {
+		return nil, newDecoderError(friendlyName, err)
+	}
+	return datum, nil
+}
 
 func newJSONDecoder(goType string) jsonDecoderFunction {
 	return func(r io.Reader) (interface{}, error) {
-		dec := json.NewDecoder(r)
-		dec.UseNumber()
-		var datum interface{}
-		if err := dec.Decode(&datum); err != nil {
-			return nil, newDecoderError(goType, err)
-		}
-		return datum, nil
+		return jsonDecode(r, goType)
 	}
 }
 
@@ -45,7 +51,7 @@ func booleanJSONDecoder(r io.Reader) (interface{}, error) {
 
 func intJSONDecoder(r io.Reader) (interface{}, error) {
 	someValue, err := newJSONDecoder("int")(r)
- 	if err != nil {
+	if err != nil {
 		return nil, err
 	}
 	someNumber, ok := someValue.(json.Number)
@@ -56,12 +62,12 @@ func intJSONDecoder(r io.Reader) (interface{}, error) {
 	if err != nil {
 		return nil, newDecoderError("int", "expected int64: received %v", someNumber)
 	}
-        return int32(someInt), nil
+	return int32(someInt), nil
 }
 
 func longJSONDecoder(r io.Reader) (interface{}, error) {
 	someValue, err := newJSONDecoder("long")(r)
- 	if err != nil {
+	if err != nil {
 		return nil, err
 	}
 	someNumber, ok := someValue.(json.Number)
@@ -73,7 +79,7 @@ func longJSONDecoder(r io.Reader) (interface{}, error) {
 
 func floatJSONDecoder(r io.Reader) (interface{}, error) {
 	someValue, err := newJSONDecoder("float")(r)
- 	if err != nil {
+	if err != nil {
 		return nil, err
 	}
 	someNumber, ok := someValue.(json.Number)
@@ -84,19 +90,19 @@ func floatJSONDecoder(r io.Reader) (interface{}, error) {
 	if err != nil {
 		return nil, newDecoderError("int", "expected : float64 received %v", someNumber)
 	}
-        return float32(someFloat), nil
+	return float32(someFloat), nil
 }
 
 func doubleJSONDecoder(r io.Reader) (interface{}, error) {
 	someValue, err := newJSONDecoder("double")(r)
- 	if err != nil {
+	if err != nil {
 		return nil, err
 	}
 	someNumber, ok := someValue.(json.Number)
 	if !ok {
 		return nil, newDecoderError("double", "expected json.Number: received %T", someNumber)
 	}
-        return someNumber.Float64()
+	return someNumber.Float64()
 }
 
 func bytesJSONDecoder(r io.Reader) (interface{}, error) {
@@ -112,5 +118,5 @@ func bytesJSONDecoder(r io.Reader) (interface{}, error) {
 }
 
 func stringJSONDecoder(r io.Reader) (interface{}, error) {
-        return newJSONDecoder("string")(r)
+	return newJSONDecoder("string")(r)
 }

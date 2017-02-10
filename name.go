@@ -149,7 +149,7 @@ func (n name) namespace() string {
 	return n.n[:li]
 }
 
-func (n name) shortname() string {
+func (n name) basename() string {
 	li := strings.LastIndex(n.n, ".")
 	if li == -1 {
 		return n.n
